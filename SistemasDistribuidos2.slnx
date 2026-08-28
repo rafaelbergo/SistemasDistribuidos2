@@ -1,6 +1,10 @@
 <Solution>
   <Folder Name="/Services/">
+    <Project Path="MS.Entrega/MS.Entrega.csproj" />
+    <Project Path="MS.Estoque/MS.Estoque.csproj" />
+    <Project Path="MS.Pagamento/MS.Pagamento.csproj" />
     <Project Path="MS.Principal/MS.Principal.csproj" />
+    <Project Path="MS.Promocoes/MS.Promocoes.csproj" />
   </Folder>
   <Project Path="Foundation/Foundation.csproj" />
 </Solution>
