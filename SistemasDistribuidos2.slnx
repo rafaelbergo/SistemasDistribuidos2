@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/Services/">
+    <Project Path="MS.Principal/MS.Principal.csproj" />
+  </Folder>
+  <Project Path="Foundation/Foundation.csproj" />
+</Solution>
