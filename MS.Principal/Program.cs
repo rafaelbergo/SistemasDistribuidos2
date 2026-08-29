@@ -1,7 +1,7 @@
-﻿using Foundation;
+﻿using Foundation.Keys;
 
-Console.WriteLine("Test");
+string solutionRootPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
+var keyManagement = new KeyManagement(solutionRootPath, "MS.Principal");
 
-KeyGenerator.GenerateKeyPair();
+keyManagement.CheckKeys();
 
-Console.WriteLine("Chaves geradas com sucesso.");

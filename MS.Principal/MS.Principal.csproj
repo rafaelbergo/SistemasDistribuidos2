@@ -11,4 +11,8 @@
     <ProjectReference Include="..\Foundation\Foundation.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="Keys\" />
+  </ItemGroup>
+
 </Project>
