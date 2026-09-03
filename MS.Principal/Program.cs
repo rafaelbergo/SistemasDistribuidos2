@@ -1,6 +1,9 @@
 ﻿using Foundation;
 using Foundation.Keys;
 
+Console.Title = "MS.Principal";
+
+// Set base paths and verify if keys exist
 string solutionRootPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
 var keyManagement = new KeyManagement(solutionRootPath, "MS.Principal");
 var signature = new SignatureService();
