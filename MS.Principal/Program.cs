@@ -1,4 +1,4 @@
-﻿using Foundation;
+using Foundation;
 using Foundation.Keys;
 using Foundation.Models;
 using RabbitMQ.Client;
@@ -37,7 +37,7 @@ await channel.ExchangeDeclareAsync(
     durable: true
 );
 
-/*
+
 while (true)
 {
     Console.WriteLine("[MS.Principal] Operações:");
@@ -51,8 +51,123 @@ while (true)
     switch (mainMenuOption)
     {
         case "1":
-            Console.WriteLine("[MS.Principal] Creating a new order...");
+        {
+            Console.WriteLine("[MS.Principal] Criando novo pedido...");
+            // Cria novo pedido
+            var novoPedido = new PedidoCriado
+            {
+                ClienteId = "915d5e76-ab62-43ae-99c4-4d2075125cc9"
+            };
+
+            bool pedidoFinalizado = false;
+            bool pedidoCancelado = false;
+
+            while (!pedidoFinalizado && !pedidoCancelado)
+            {
+                Console.Write("ID do item: ");
+                var itemId = Console.ReadLine()?.Trim();
+                if (itemId is null)
+                {
+                    pedidoCancelado = true;
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(itemId))
+                {
+                    Console.WriteLine("[MS.Principal] O ID do item não pode ser vazio.");
+                    continue;
+                }
+
+                if (novoPedido.Itens.Any(item => item.Id == itemId))
+                {
+                    Console.WriteLine("[MS.Principal] Este item já foi adicionado ao pedido.");
+                    continue;
+                }
+
+                int quantidade;
+                while (true)
+                {
+                    Console.Write("Quantidade: ");
+                    var quantidadeInformada = Console.ReadLine();
+                    if (quantidadeInformada is null)
+                    {
+                        pedidoCancelado = true;
+                        break;
+                    }
+
+                    if (int.TryParse(quantidadeInformada, out quantidade) && quantidade > 0)
+                    {
+                        novoPedido.Itens.Add(new ItemPedido { Id = itemId, Quantidade = quantidade });
+                        Console.WriteLine($"[MS.Principal] Item {itemId} adicionado: {quantidade} unidade(s).");
+                        break;
+                    }
+
+                    Console.WriteLine("[MS.Principal] Informe uma quantidade inteira maior que zero.");
+                }
+
+                if (pedidoCancelado)
+                {
+                    break;
+                }
+
+                bool adicionarOutro = false;
+                while (!adicionarOutro && !pedidoFinalizado && !pedidoCancelado)
+                {
+                    Console.WriteLine("1. Adicionar outro item");
+                    Console.WriteLine("2. Finalizar pedido");
+                    Console.WriteLine("3. Cancelar e voltar");
+
+                    switch (Console.ReadLine())
+                    {
+                        case "1":
+                            adicionarOutro = true;
+                            break;
+                        case "2":
+                            pedidoFinalizado = true;
+                            break;
+                        case "3":
+                        case null:
+                            pedidoCancelado = true;
+                            break;
+                        default:
+                            Console.WriteLine("[MS.Principal] Opção inválida. Tente novamente.");
+                            break;
+                    }
+                }
+            }
+
+            if (pedidoCancelado)
+            {
+                Console.WriteLine("[MS.Principal] Criação do pedido cancelada.");
+                break;
+            }
+
+            // Assina o pedido
+            string pedidoJson = JsonSerializer.Serialize(novoPedido);
+            var signed = signature.SignText(pedidoJson, privateKeyPath);
+
+            // Cria Mensagem
+            var eventMessage = new Message<PedidoCriado>
+            {
+                Producer = "MS.Principal",
+                Content = novoPedido,
+                Signature = signed,
+            };
+
+            // Serializa mensagem
+            string jsonMensagem = JsonSerializer.Serialize(eventMessage);
+            byte[] body = Encoding.UTF8.GetBytes(jsonMensagem);
+
+            // Envia mensagem ao evento
+            await channel.BasicPublishAsync(
+                exchange: "eCommerce",
+                routingKey: "pedido.criado",
+                body: body
+            );
+
+            Console.WriteLine($"Mensagem enviada:\n{jsonMensagem}");
             break;
+        }
         case "2":
             Console.WriteLine("[MS.Principal] Listing orders...");
             break;
@@ -63,49 +178,11 @@ while (true)
             Console.WriteLine("[MS.Principal] Consulting orders and status...");
             break;
         case "5":
+        case null:
             Console.WriteLine("[MS.Principal] Saindo...");
             return;
         default:
             Console.WriteLine("[MS.Principal] Invalid option. Please try again.");
             break;
     }
-}*/
-
-
-
-// Cria pedido teste
-var novoPedido = new PedidoCriado
-{
-    ClienteId = "915d5e76-ab62-43ae-99c4-4d2075125cc9",
-    Itens =
-    [
-        new ItemPedido { Id = Guid.NewGuid().ToString(), Quantidade = 1 },
-        new ItemPedido { Id = Guid.NewGuid().ToString(), Quantidade = 10 }
-    ]
-};
-
-// Assina o pedido
-string pedidoJson = JsonSerializer.Serialize(novoPedido);
-var signed = signature.SignText(pedidoJson, privateKeyPath);
-
-// Cria Mensagem
-var eventMessage = new Message<PedidoCriado>
-{
-    Producer = "MS.Principal",
-    Content = novoPedido,
-    Signature = signed, 
-};
-
-// Serializa mensagem
-string jsonMensagem = JsonSerializer.Serialize(eventMessage);
-byte[] body = Encoding.UTF8.GetBytes(jsonMensagem);
-
-// Envia mensagem ao evento
-await channel.BasicPublishAsync(
-    exchange: "eCommerce",
-    routingKey: "pedido.criado",
-    body: body
-);
-
-Console.WriteLine($"Mensagem enviada:\n{jsonMensagem}");
-Console.ReadLine();
+}
