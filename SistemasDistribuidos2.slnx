@@ -1,4 +1,8 @@
 <Solution>
+  <Folder Name="/Consumers/">
+    <Project Path="Consumidor.C1/Consumidor.C1.csproj" Id="4dda57da-9934-4a6e-8697-48b3992683d8" />
+    <Project Path="Consumidor.C2/Consumidor.C2.csproj" Id="2971cc19-a724-4def-9a60-bd6f8753aa7e" />
+  </Folder>
   <Folder Name="/Services/">
     <Project Path="MS.Entrega/MS.Entrega.csproj" />
     <Project Path="MS.Estoque/MS.Estoque.csproj" />
