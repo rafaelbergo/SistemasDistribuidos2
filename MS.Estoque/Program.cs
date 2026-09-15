@@ -25,6 +25,10 @@ var inventory = new Dictionary<string, int>
     { "D", 1 },
 };
 
+// Keep the original reservation so rejection/deletion restores it only once.
+var reservations = new Dictionary<string, List<ItemPedido>>();
+var processedOrders = new HashSet<string>();
+
 // RabbitMQ Connection
 var factory = new ConnectionFactory { HostName = "localhost" };
 using var connection = await factory.CreateConnectionAsync();
@@ -60,6 +64,12 @@ await channel.QueueBindAsync(
 );
 
 // Configure async consumer
+await channel.QueueBindAsync(
+    queue: queueName,
+    exchange: "eCommerce",
+    routingKey: "pagamento.recusado"
+);
+
 var consumer = new AsyncEventingBasicConsumer(channel);
 
 consumer.ReceivedAsync += async (model, ea) =>
@@ -106,6 +116,12 @@ consumer.ReceivedAsync += async (model, ea) =>
     // Check routing key
     if (routingKey == "pedido.criado")
     {
+        if (!processedOrders.Add(eventMessage.Content.Id))
+        {
+            Console.WriteLine($"[MS.Estoque] Order {eventMessage.Content.Id} already processed; ignoring duplicate.");
+            return;
+        }
+
         bool itemsAvailable = true;
 
         // Check if all items are available
@@ -128,6 +144,8 @@ consumer.ReceivedAsync += async (model, ea) =>
                 Console.WriteLine($"[MS.Estoque] Removed {item.Quantidade} of Item {item.Id}. Remaining: {inventory[item.Id]}");
             }
 
+            reservations[eventMessage.Content.Id] = eventMessage.Content.Itens;
+
             // Publish success event
             await PublishEventAsync(channel, "pedido.estoque_ok", eventMessage.Content, signatureService, privateKeyPath);
         }
@@ -140,15 +158,21 @@ consumer.ReceivedAsync += async (model, ea) =>
         }
     }
 
-    else if (routingKey == "pedido.excluido")
+    else if (routingKey is "pedido.excluido")
     {
+        if (!reservations.Remove(eventMessage.Content.Id, out var reservedItems))
+        {
+            Console.WriteLine($"[MS.Estoque] No reservation to restore for Order {eventMessage.Content.Id}; event '{routingKey}' ignored.");
+            return;
+        }
+
         // Restore items to inventory
-        foreach (var item in eventMessage.Content.Itens)
+        foreach (var item in reservedItems)
         {
             if (inventory.ContainsKey(item.Id))
             {
                 inventory[item.Id] += item.Quantidade;
-                Console.WriteLine($"[MS.Estoque] Restored {item.Quantidade} for Item {item.Id}");
+                Console.WriteLine($"[MS.Estoque] Restored {item.Quantidade} for Item {item.Id}. Available: {inventory[item.Id]}. Order: {eventMessage.Content.Id}, event: {routingKey}");
             }
         }
     }

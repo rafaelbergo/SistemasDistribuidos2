@@ -2,6 +2,8 @@ using Foundation;
 using Foundation.Keys;
 using Foundation.Models;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 
@@ -37,6 +39,71 @@ await channel.ExchangeDeclareAsync(
     durable: true
 );
 
+
+// A dedicated queue gives Principal its own copy of each lifecycle event.
+using var consumerChannel = await connection.CreateChannelAsync();
+const string queueName = "fila_principal";
+await consumerChannel.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
+string[] orderEvents =
+[
+    "pagamento.aprovado",
+    "pagamento.recusado",
+    "pedido.enviado",
+    "pedido.estoque_ok",
+    "estoque.indisponivel"
+];
+foreach (string routingKey in orderEvents)
+{
+    await consumerChannel.QueueBindAsync(queueName, "eCommerce", routingKey);
+}
+
+var orders = new ConcurrentDictionary<string, (PedidoCriado Pedido, string Status)>();
+var consumer = new AsyncEventingBasicConsumer(consumerChannel);
+consumer.ReceivedAsync += (_, ea) =>
+{
+    try
+    {
+        var message = JsonSerializer.Deserialize<Message<PedidoCriado>>(ea.Body.Span);
+        if (message?.Content is null)
+        {
+            Console.WriteLine("[MS.Principal] Mensagem inválida: pedido ausente.");
+            return Task.CompletedTask;
+        }
+
+        string? expectedProducer = ea.RoutingKey switch
+        {
+            "pagamento.aprovado" or "pagamento.recusado" => "MS.Pagamento",
+            "pedido.enviado" => "MS.Entrega",
+            "pedido.estoque_ok" or "estoque.indisponivel" => "MS.Estoque",
+            _ => null
+        };
+        if (expectedProducer is null || message.Producer != expectedProducer)
+        {
+            Console.WriteLine($"[MS.Principal] Produtor inesperado para '{ea.RoutingKey}'.");
+            return Task.CompletedTask;
+        }
+
+        string producerKey = Path.Combine(solutionRootPath, "MS.Principal", "Keys", $"{expectedProducer}.public.pem");
+        if (!File.Exists(producerKey) || !signature.VerifySignature(
+                JsonSerializer.Serialize(message.Content), message.Signature, producerKey))
+        {
+            Console.WriteLine($"[MS.Principal] Evento descartado: chave ausente ou assinatura inválida de {expectedProducer}.");
+            return Task.CompletedTask;
+        }
+
+        orders.AddOrUpdate(message.Content.Id,
+            (message.Content, ea.RoutingKey),
+            (_, current) => StatusStage(ea.RoutingKey) > StatusStage(current.Status)
+                ? (message.Content, ea.RoutingKey) : current);
+        Console.WriteLine($"\n[MS.Principal] Pedido {message.Content.Id}: evento '{ea.RoutingKey}' recebido de {message.Producer}.");
+    }
+    catch (Exception ex) when (ex is JsonException or FormatException or System.Security.Cryptography.CryptographicException)
+    {
+        Console.WriteLine($"[MS.Principal] Evento inválido: {ex.Message}");
+    }
+    return Task.CompletedTask;
+};
+await consumerChannel.BasicConsumeAsync(queueName, autoAck: true, consumer: consumer);
 
 while (true)
 {
@@ -159,6 +226,7 @@ while (true)
             byte[] body = Encoding.UTF8.GetBytes(jsonMensagem);
 
             // Envia mensagem ao evento
+            orders.TryAdd(novoPedido.Id, (novoPedido, "pedido.criado"));
             await channel.BasicPublishAsync(
                 exchange: "eCommerce",
                 routingKey: "pedido.criado",
@@ -169,13 +237,21 @@ while (true)
             break;
         }
         case "2":
-            Console.WriteLine("[MS.Principal] Listing orders...");
+            foreach (var order in orders.Values.OrderBy(order => order.Pedido.Id))
+            {
+                Console.WriteLine($"[MS.Principal] Pedido {order.Pedido.Id}, cliente {order.Pedido.ClienteId}");
+                foreach (var item in order.Pedido.Itens)
+                    Console.WriteLine($"  Item {item.Id}: {item.Quantidade} unidade(s)");
+            }
+            if (orders.IsEmpty) Console.WriteLine("[MS.Principal] Nenhum pedido registrado.");
             break;
         case "3":
             Console.WriteLine("[MS.Principal] Removing orders...");
             break;
         case "4":
-            Console.WriteLine("[MS.Principal] Consulting orders and status...");
+            foreach (var order in orders.Values.OrderBy(order => order.Pedido.Id))
+                Console.WriteLine($"[MS.Principal] Pedido {order.Pedido.Id}: {order.Status}");
+            if (orders.IsEmpty) Console.WriteLine("[MS.Principal] Nenhum pedido registrado.");
             break;
         case "5":
         case null:
@@ -186,3 +262,13 @@ while (true)
             break;
     }
 }
+
+// Events from different producers may arrive out of order.
+static int StatusStage(string status) => status switch
+{
+    "pedido.criado" => 0,
+    "pedido.estoque_ok" => 1,
+    "pagamento.aprovado" or "pagamento.recusado" or "estoque.indisponivel" => 2,
+    "pedido.enviado" => 3,
+    _ => -1
+};

@@ -100,6 +100,7 @@ consumer.ReceivedAsync += async (model, ea) =>
         {
             Console.WriteLine($"[MS.Pagamento] Payment rejected for OrderId: {eventMessage.Content.Id}");
             await PublishEventAsync(channel, "pagamento.recusado", eventMessage.Content, signatureService, privateKeyPath);
+            await PublishEventAsync(channel, "pedido.excluido", eventMessage.Content, signatureService, privateKeyPath);
         }
     }
 
