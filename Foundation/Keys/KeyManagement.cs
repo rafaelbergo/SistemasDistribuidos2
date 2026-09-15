@@ -94,6 +94,16 @@ public class KeyManagement
 
             CopyPublicKey(publicKeyPath, destinationPath, microservice);
         }
+
+        if (_currentProjectName == "MS.Promocoes")
+        {
+            foreach (string consumer in new[] { "Consumidor.C1", "Consumidor.C2" })
+            {
+                string consumerKeysDirectory = Path.Combine(GetProjectPath(consumer), "Keys");
+                Directory.CreateDirectory(consumerKeysDirectory);
+                File.Copy(publicKeyPath, Path.Combine(consumerKeysDirectory, publicKeyName), overwrite: true);
+            }
+        }
     }
 
     private static void CopyPublicKey(string sourcePath, string destinationPath, string destinationMicroservice)

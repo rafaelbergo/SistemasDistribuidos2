@@ -40,3 +40,24 @@ Se não conseguir conectar ao mecanismo Docker, abra o Docker Desktop e aguarde 
 Se uma porta já estiver ocupada por outro RabbitMQ, pare essa outra instância antes de iniciar o Compose.
 
 Os dados do RabbitMQ ficam no volume `rabbitmq_data` e são preservados ao parar ou recriar o contêiner.
+
+## Consumidores de promoções
+
+Os dois processos recebem notificações exclusivamente pelo RabbitMQ, sem chamar outros microsserviços. Cada um declara sua própria fila no exchange Topic `Promoções`:
+
+| Processo | Fila | Routing keys |
+| --- | --- | --- |
+| Consumidor.C1 | `fila_promocoes_c1` | `promocao.categoria.A` e `promocao.categoria.B` |
+| Consumidor.C2 | `fila_promocoes_c2` | `promocao.categoria.*` (todas as categorias) |
+
+Com o RabbitMQ em execução, abra três terminais na pasta da solução e execute um comando em cada terminal:
+
+```powershell
+dotnet run --project MS.Promocoes
+dotnet run --project Consumidor.C1
+dotnet run --project Consumidor.C2
+```
+
+Inicie o MS.Promocoes atualizado para distribuir sua chave pública às pastas `Keys` dos consumidores. Aguarde ambos exibirem `Aguardando promoções` antes de publicar pelo menu do MS.Promocoes. Promoções A e B aparecem nos dois consumidores; promoções C aparecem somente no C2. O C2 também recebe categorias novas sem alteração no código.
+
+Os consumidores exibem produto, categoria, desconto e descrição após validar a assinatura localmente. Mensagens inválidas são descartadas; mensagens válidas são confirmadas após a exibição. Pressione Enter no terminal de cada consumidor para encerrá-lo. As filas permanecem no RabbitMQ após o encerramento.
