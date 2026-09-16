@@ -64,16 +64,18 @@ public sealed class PedidoRepository
             return Copy(database.Pedidos.Find(p => p.Pedido.Id == id && !p.Excluido));
     }
 
-    public PedidoRegistro Criar(PedidoCriado pedido)
+    public PedidoRegistro Criar(PedidoCriado pedido, bool enviar = false)
     {
         Validar(pedido);
         return Alterar(db =>
         {
             if (db.Pedidos.Any(p => p.Pedido.Id == pedido.Id))
                 throw new InvalidOperationException("ID de pedido já cadastrado.");
-            var registro = new PedidoRegistro { Pedido = Copy(pedido) };
-            registro.Historico.Add(new PedidoHistorico { Evento = "rascunho.criado" });
+            var registro = new PedidoRegistro { Pedido = Copy(pedido), Status = enviar ? "pedido.criado" : "rascunho" };
+            registro.Historico.Add(new PedidoHistorico { Evento = enviar ? "pedido.criado" : "rascunho.criado" });
             db.Pedidos.Add(registro);
+            if (enviar)
+                db.PublicacoesPendentes.Add(new Message<PedidoCriado> { Producer = "MS.Principal", Content = Copy(pedido) });
             return registro;
         });
     }

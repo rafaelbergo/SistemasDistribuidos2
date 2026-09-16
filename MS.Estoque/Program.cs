@@ -72,6 +72,8 @@ await channel.QueueBindAsync(
 
 var consumer = new AsyncEventingBasicConsumer(channel);
 
+await channel.QueueBindAsync(queueName, "eCommerce", "produtos.consultar");
+
 consumer.ReceivedAsync += async (model, ea) =>
 {
     string routingKey = ea.RoutingKey;
@@ -79,6 +81,41 @@ consumer.ReceivedAsync += async (model, ea) =>
     string jsonReceiverMessage = Encoding.UTF8.GetString(body);
 
     Console.WriteLine($"[MS.Estoque] Message rececived by {routingKey}");
+
+    if (routingKey == "produtos.consultar")
+    {
+        try
+        {
+            var request = JsonSerializer.Deserialize<Message<ConsultaProdutos>>(jsonReceiverMessage);
+            string principalKey = Path.Combine(solutionRootPath, "MS.Estoque", "Keys", "MS.Principal.public.pem");
+            if (request?.Producer != "MS.Principal" || request.Content is null ||
+                !Guid.TryParseExact(request.Content.Id, "N", out _) ||
+                !signatureService.VerifySignature(JsonSerializer.Serialize(request.Content), request.Signature, principalKey))
+            {
+                Console.WriteLine("[MS.Estoque] Consulta de produtos inválida; descartada.");
+                return;
+            }
+
+            // This callback also handles reservations, so the snapshot reflects their current balance.
+            var catalogo = new CatalogoProdutos
+            {
+                ConsultaId = request.Content.Id,
+                Produtos = inventory.OrderBy(item => item.Key).Select(item => new ProdutoDisponivel
+                {
+                    Id = item.Key,
+                    Descricao = $"Produto {item.Key}",
+                    QuantidadeDisponivel = item.Value
+                }).ToList()
+            };
+            await PublishEventAsync(channel, $"produtos.listados.{request.Content.Id}", catalogo, signatureService, privateKeyPath);
+        }
+        catch (Exception ex) when (ex is JsonException or FormatException or System.Security.Cryptography.CryptographicException
+            or IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            Console.WriteLine($"[MS.Estoque] Consulta de produtos descartada: {ex.Message}");
+        }
+        return;
+    }
 
     var eventMessage = JsonSerializer.Deserialize<Message<PedidoCriado>>(jsonReceiverMessage);
     if (eventMessage == null || eventMessage.Content == null)
@@ -189,12 +226,12 @@ await channel.BasicConsumeAsync(
 Console.ReadLine();
 
 
-async Task PublishEventAsync(IChannel channel, string routingKey, PedidoCriado pedido, SignatureService signatureService, string privateKeyPath)
+async Task PublishEventAsync<T>(IChannel channel, string routingKey, T pedido, SignatureService signatureService, string privateKeyPath)
 {
     string responseJson = JsonSerializer.Serialize(pedido);
     string signature = signatureService.SignText(responseJson, privateKeyPath);
     
-    var responseMessage = new Message<PedidoCriado>
+    var responseMessage = new Message<T>
     {
         Producer = "MS.Estoque",
         Content = pedido,

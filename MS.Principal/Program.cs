@@ -93,13 +93,12 @@ try
     while (running)
     {
         Console.WriteLine("\n[MS.Principal] PEDIDOS");
-        Console.WriteLine("1. Criar pedido (rascunho)");
+        Console.WriteLine("1. Criar pedido");
         Console.WriteLine("2. Listar pedidos e status");
         Console.WriteLine("3. Consultar pedido e histórico");
-        Console.WriteLine("4. Editar rascunho");
-        Console.WriteLine("5. Excluir pedido da listagem");
-        Console.WriteLine("6. Enviar rascunho para processamento");
-        Console.WriteLine("7. Listar registros excluídos");
+        Console.WriteLine("4. Visualizar produtos");
+        if (orders.Listar().Any(p => p.Status == "rascunho"))
+            Console.WriteLine("5. Enviar rascunho salvo anteriormente");
         Console.WriteLine("0. Sair");
         Console.Write("Opção: ");
         try
@@ -109,11 +108,8 @@ try
                 case "1":
                     var novo = LerPedido();
                     if (novo is null) break;
-                    var criado = orders.Criar(novo);
-                    Console.WriteLine($"[MS.Principal] Pedido salvo: {criado.Pedido.Id}. Status: rascunho.");
-                    Console.Write("Enviar para processamento agora? (s/N): ");
-                    if (Console.ReadLine()?.Trim().Equals("s", StringComparison.OrdinalIgnoreCase) == true)
-                        Enviar(criado.Pedido.Id);
+                    var criado = orders.Criar(novo, enviar: true);
+                    Console.WriteLine($"[MS.Principal] Pedido salvo: {criado.Pedido.Id}. Status: {criado.Status}. Aguardando processamento.");
                     break;
                 case "2":
                     Listar(orders.Listar());
@@ -123,28 +119,18 @@ try
                     if (consultado is not null) Exibir(consultado);
                     break;
                 case "4":
-                    var atual = Selecionar();
-                    if (atual is null) break;
-                    if (atual.Status != "rascunho")
-                        throw new InvalidOperationException("Somente rascunhos podem ser editados.");
-                    Exibir(atual);
-                    var editado = LerPedido(atual.Pedido);
-                    if (editado is null) break;
-                    orders.Editar(atual.Pedido.Id, editado.ClienteId, editado.Itens);
-                    Console.WriteLine("[MS.Principal] Alterações salvas.");
+                    Console.WriteLine("[MS.Principal] Consultando produtos...");
+                    var catalogo = await ConsultaProdutosClient.ConsultarAsync(connection, privateKeyPath,
+                        Path.Combine(solutionRootPath, "MS.Principal", "Keys", "MS.Estoque.public.pem"));
+                    Console.WriteLine("ID | Descrição | Quantidade disponível");
+                    foreach (var produto in catalogo.Produtos)
+                        Console.WriteLine($"{produto.Id} | {produto.Descricao} | {produto.QuantidadeDisponivel}");
+                    if (catalogo.Produtos.Count == 0) Console.WriteLine("Nenhum produto cadastrado.");
+                    Console.WriteLine("Use esses IDs ao criar o pedido. A disponibilidade será verificada novamente no processamento.");
                     break;
                 case "5":
-                    var excluido = Selecionar();
-                    if (excluido is null) break;
-                    orders.Excluir(excluido.Pedido.Id);
-                    Console.WriteLine("[MS.Principal] Pedido excluído da listagem. Histórico preservado.");
-                    break;
-                case "6":
                     var envio = Selecionar();
                     if (envio is not null) Enviar(envio.Pedido.Id);
-                    break;
-                case "7":
-                    Listar(orders.Listar(incluirExcluidos: true).Where(p => p.Excluido).ToList());
                     break;
                 case "0":
                 case null:
@@ -155,7 +141,7 @@ try
                     break;
             }
         }
-        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException or TimeoutException)
         {
             Console.WriteLine($"[MS.Principal] Operação não concluída: {ex.Message}");
         }
@@ -207,29 +193,18 @@ void Exibir(PedidoRegistro registro)
             (evento.Aplicado ? "" : " | Não alterou o status"));
 }
 
-PedidoCriado? LerPedido(PedidoCriado? original = null)
+PedidoCriado? LerPedido()
 {
     Console.WriteLine("Digite /cancelar para voltar sem salvar.");
-    var pedido = new PedidoCriado { Id = original?.Id ?? Guid.NewGuid().ToString() };
+    var pedido = new PedidoCriado();
     while (true)
     {
-        Console.Write(original is null ? "ID do cliente: " : $"ID do cliente (Enter mantém {original.ClienteId}): ");
+        Console.Write("ID do cliente: ");
         string? cliente = Console.ReadLine()?.Trim();
         if (cliente is null or "/cancelar") return null;
-        pedido.ClienteId = string.IsNullOrEmpty(cliente) ? original?.ClienteId ?? "" : cliente;
+        pedido.ClienteId = cliente;
         if (!string.IsNullOrWhiteSpace(pedido.ClienteId)) break;
         Console.WriteLine("Informe o ID do cliente.");
-    }
-    if (original is not null)
-    {
-        Console.Write("Substituir a lista de itens? (s/N): ");
-        string? resposta = Console.ReadLine()?.Trim();
-        if (resposta is null or "/cancelar") return null;
-        if (!resposta.Equals("s", StringComparison.OrdinalIgnoreCase))
-        {
-            pedido.Itens = original.Itens;
-            return pedido;
-        }
     }
     while (true)
     {

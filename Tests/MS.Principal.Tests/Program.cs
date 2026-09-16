@@ -6,6 +6,34 @@ string root = Path.Combine(Path.GetTempPath(), "principal-tests-" + Guid.NewGuid
 Directory.CreateDirectory(root);
 int passed = 0;
 
+Run("New orders persist together with their publication and receive lifecycle events immediately", () =>
+{
+    var (repo, path) = Store();
+    var pedido = Order();
+    repo.Criar(pedido, enviar: true);
+    repo = new PedidoRepository(path);
+    Equal("pedido.criado", repo.Consultar(pedido.Id)!.Status);
+    Equal(pedido.Id, repo.PublicacoesPendentes().Single().Content.Id);
+    foreach (string evento in new[] { "pedido.estoque_ok", "pagamento.aprovado", "pedido.enviado" })
+    {
+        repo.AplicarEvento(evento, Event(pedido));
+        repo = new PedidoRepository(path);
+        Equal(evento, repo.Consultar(pedido.Id)!.Status);
+    }
+    Equal(4, repo.Consultar(pedido.Id)!.Historico.Count);
+});
+
+Run("Failed immediate creation does not leave a partial order or publication", () =>
+{
+    var (repo, path) = Store();
+    Directory.CreateDirectory(path + ".tmp");
+    try { repo.Criar(Order(), enviar: true); throw new Exception("Expected a filesystem failure"); }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+    Equal(0, repo.Listar().Count);
+    Equal(0, repo.PublicacoesPendentes().Count);
+    Equal(false, File.Exists(path));
+});
+
 Run("CRUD persists drafts, edits and logical deletion across restarts", () =>
 {
     var (repo, path) = Store();
