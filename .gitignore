@@ -363,3 +363,4 @@ MigrationBackup/
 FodyWeavers.xsd
 
 *.pem
+MS.Principal/Data/

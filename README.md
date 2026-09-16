@@ -1,5 +1,38 @@
 # SistemasDistribuidos2
 
+## CRUD de pedidos no MS.Principal
+
+O Principal salva os pedidos, status, histórico e publicações pendentes em `MS.Principal/Data/pedidos.json`. Os dados são carregados ao reiniciar e não são versionados no Git. Execute apenas uma instância do Principal por arquivo; um bloqueio impede gravações concorrentes entre processos. Para usar outro arquivo, configure a variável `MS_PRINCIPAL_DATA_PATH`.
+
+| Opção | Operação |
+| --- | --- |
+| 1 | Criar e salvar um rascunho; permite enviá-lo imediatamente ao processamento |
+| 2 | Listar pedidos, cliente, status e indicação de publicação pendente |
+| 3 | Consultar itens, datas e histórico pelo ID completo do pedido |
+| 4 | Editar cliente e itens de um rascunho |
+| 5 | Excluir da listagem um rascunho ou pedido concluído |
+| 6 | Enviar um rascunho salvo para processamento |
+| 7 | Listar registros excluídos |
+| 0 | Sair |
+
+Na criação, informe o cliente e os itens com quantidades positivas. Enter no campo do ID do item finaliza a lista; `/cancelar` abandona a edição sem salvar. Para testar o CRUD, crie um rascunho sem enviá-lo, consulte e edite pelo ID exibido. Reinicie o Principal para verificar que as alterações continuam salvas.
+
+Após o envio, os dados do pedido ficam bloqueados para edição, pois os outros serviços já podem ter reservado estoque ou processado o pagamento. Os eventos `pedido.estoque_ok`, `estoque.indisponivel`, `pagamento.aprovado`, `pagamento.recusado` e `pedido.enviado` atualizam o status e o histórico automaticamente, após a validação da assinatura. Eventos duplicados não repetem a atualização; eventos atrasados não fazem o status regredir nem sobrescrevem os itens.
+
+A exclusão é lógica: remove o pedido da listagem normal, preservando o registro e o histórico. É permitida para rascunhos e pedidos nos estados `pagamento.recusado`, `estoque.indisponivel` ou `pedido.enviado`. Excluir um registro concluído não publica cancelamento nem devolve estoque novamente. Pedidos em processamento precisam concluir o fluxo antes de serem excluídos; eventos tardios não recriam registros excluídos.
+
+O pedido e sua publicação pendente são salvos juntos antes do envio de `pedido.criado`. O Principal tenta publicar a cada três segundos e remove a pendência após a confirmação do RabbitMQ; pendências sobrevivem a reinícios. Inicie o MS.Estoque para criar a fila que recebe o pedido. Se a aplicação cair entre a confirmação e a gravação local, o evento pode ser reenviado com o mesmo ID. As confirmações de consumo dos eventos de retorno ocorrem somente após a gravação em disco.
+
+Essa persistência pertence ao Principal; não altera o armazenamento em memória dos demais serviços nem recupera pedidos que existiam apenas em memória em versões anteriores.
+
+### Testes do armazenamento e ciclo de vida
+
+```powershell
+dotnet run --project Tests/MS.Principal.Tests -c Release
+```
+
+Os testes usam arquivos temporários e cobrem CRUD, reinício, eventos, duplicatas, concorrência e falhas de gravação, sem precisar de RabbitMQ.
+
 ## RabbitMQ com Docker
 
 O RabbitMQ roda em um contêiner; os projetos C# continuam sendo executados no Visual Studio.

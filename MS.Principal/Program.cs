@@ -1,75 +1,56 @@
 using Foundation;
 using Foundation.Keys;
 using Foundation.Models;
+using MS.Principal;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
 Console.Title = "MS.Principal";
-
-// Set base paths and verify if keys exist
+Console.OutputEncoding = Encoding.UTF8;
 string solutionRootPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
+string dataPath = Environment.GetEnvironmentVariable("MS_PRINCIPAL_DATA_PATH")
+    ?? Path.Combine(solutionRootPath, "MS.Principal", "Data", "pedidos.json");
+dataPath = Path.GetFullPath(dataPath);
+Directory.CreateDirectory(Path.GetDirectoryName(dataPath)!);
+// Prevent two Principal instances from overwriting the same database.
+using var dataLock = new FileStream(dataPath + ".lock", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+var orders = new PedidoRepository(dataPath);
+Console.WriteLine($"[MS.Principal] Pedidos carregados: {orders.Listar().Count}. Arquivo: {dataPath}");
+
 var keyManagement = new KeyManagement(solutionRootPath, "MS.Principal");
-var signature = new SignatureService();
-
 keyManagement.CheckKeys();
-
-// Test sign and verify text
-string text = "Test message";
+var signature = new SignatureService();
 string privateKeyPath = Path.Combine(solutionRootPath, "MS.Principal", "Keys", "MS.Principal.private.pem");
-string publicKeyPath = Path.Combine(solutionRootPath, "MS.Principal", "Keys", "MS.Principal.public.pem");
 
-string validateResult = signature.SignText(text, privateKeyPath);
-Console.WriteLine(validateResult);
-
-bool isVerified = signature.VerifySignature(text, validateResult, publicKeyPath);
-Console.WriteLine($"Valid: {isVerified}");
-
-// RabbitMQ Connection
 var factory = new ConnectionFactory { HostName = "localhost" };
 using var connection = await factory.CreateConnectionAsync();
-using var channel = await connection.CreateChannelAsync();
-
-// Create Exchange
-await channel.ExchangeDeclareAsync(
-    exchange: "eCommerce",
-    type: ExchangeType.Direct,
-    durable: true
-);
-
-
-// A dedicated queue gives Principal its own copy of each lifecycle event.
+using var publisherChannel = await connection.CreateChannelAsync(new CreateChannelOptions(
+    publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true));
+await publisherChannel.ExchangeDeclareAsync("eCommerce", ExchangeType.Direct, durable: true);
 using var consumerChannel = await connection.CreateChannelAsync();
 const string queueName = "fila_principal";
 await consumerChannel.QueueDeclareAsync(queueName, durable: true, exclusive: false, autoDelete: false);
 string[] orderEvents =
 [
-    "pagamento.aprovado",
-    "pagamento.recusado",
-    "pedido.enviado",
-    "pedido.estoque_ok",
-    "estoque.indisponivel"
+    "pagamento.aprovado", "pagamento.recusado", "pedido.enviado",
+    "pedido.estoque_ok", "estoque.indisponivel"
 ];
 foreach (string routingKey in orderEvents)
-{
     await consumerChannel.QueueBindAsync(queueName, "eCommerce", routingKey);
-}
+await consumerChannel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false);
 
-var orders = new ConcurrentDictionary<string, (PedidoCriado Pedido, string Status)>();
 var consumer = new AsyncEventingBasicConsumer(consumerChannel);
-consumer.ReceivedAsync += (_, ea) =>
+consumer.ReceivedAsync += async (_, ea) =>
 {
     try
     {
         var message = JsonSerializer.Deserialize<Message<PedidoCriado>>(ea.Body.Span);
-        if (message?.Content is null)
-        {
-            Console.WriteLine("[MS.Principal] Mensagem inválida: pedido ausente.");
-            return Task.CompletedTask;
-        }
-
+        if (message?.Content is null || string.IsNullOrWhiteSpace(message.Content.Id) ||
+            string.IsNullOrWhiteSpace(message.MessageId))
+            throw new JsonException("Pedido ou ID de mensagem ausente.");
         string? expectedProducer = ea.RoutingKey switch
         {
             "pagamento.aprovado" or "pagamento.recusado" => "MS.Pagamento",
@@ -78,197 +59,238 @@ consumer.ReceivedAsync += (_, ea) =>
             _ => null
         };
         if (expectedProducer is null || message.Producer != expectedProducer)
-        {
-            Console.WriteLine($"[MS.Principal] Produtor inesperado para '{ea.RoutingKey}'.");
-            return Task.CompletedTask;
-        }
-
+            throw new JsonException($"Produtor inesperado para '{ea.RoutingKey}'.");
         string producerKey = Path.Combine(solutionRootPath, "MS.Principal", "Keys", $"{expectedProducer}.public.pem");
-        if (!File.Exists(producerKey) || !signature.VerifySignature(
-                JsonSerializer.Serialize(message.Content), message.Signature, producerKey))
-        {
-            Console.WriteLine($"[MS.Principal] Evento descartado: chave ausente ou assinatura inválida de {expectedProducer}.");
-            return Task.CompletedTask;
-        }
+        if (!signature.VerifySignature(JsonSerializer.Serialize(message.Content), message.Signature, producerKey))
+            throw new CryptographicException("Assinatura inválida.");
 
-        orders.AddOrUpdate(message.Content.Id,
-            (message.Content, ea.RoutingKey),
-            (_, current) => StatusStage(ea.RoutingKey) > StatusStage(current.Status)
-                ? (message.Content, ea.RoutingKey) : current);
-        Console.WriteLine($"\n[MS.Principal] Pedido {message.Content.Id}: evento '{ea.RoutingKey}' recebido de {message.Producer}.");
+        string status = orders.AplicarEvento(ea.RoutingKey, message);
+        Console.WriteLine($"\n[MS.Principal] Pedido {message.Content.Id}: {status}. Evento: {ea.RoutingKey}");
     }
-    catch (Exception ex) when (ex is JsonException or FormatException or System.Security.Cryptography.CryptographicException)
+    catch (Exception ex) when (ex is JsonException or FormatException or CryptographicException or ArgumentException)
     {
-        Console.WriteLine($"[MS.Principal] Evento inválido: {ex.Message}");
+        Console.WriteLine($"[MS.Principal] Evento descartado: {ex.Message}");
+        await consumerChannel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
+        return;
     }
-    return Task.CompletedTask;
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        Console.WriteLine($"[MS.Principal] Falha ao ler a chave ou salvar o pedido; evento será reprocessado: {ex.Message}");
+        await Task.Delay(1000);
+        await consumerChannel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+        return;
+    }
+    // Acknowledge only after the updated order and event history reach disk.
+    await consumerChannel.BasicAckAsync(ea.DeliveryTag, multiple: false);
 };
-await consumerChannel.BasicConsumeAsync(queueName, autoAck: true, consumer: consumer);
+string consumerTag = await consumerChannel.BasicConsumeAsync(queueName, autoAck: false, consumer: consumer);
+using var stopping = new CancellationTokenSource();
+Task publisher = Task.Run(() => PublicarPendenciasAsync(stopping.Token));
 
-while (true)
+try
 {
-    Console.WriteLine("[MS.Principal] Operações:");
-    Console.WriteLine("1. Criar novo pedido");
-    Console.WriteLine("2. Listar pedidos");
-    Console.WriteLine("3. Remover pedidos");
-    Console.WriteLine("4. Consultar pedidos e status");
-    Console.WriteLine("5. Sair");
-
-    var mainMenuOption = Console.ReadLine();
-    switch (mainMenuOption)
+    bool running = true;
+    while (running)
     {
-        case "1":
+        Console.WriteLine("\n[MS.Principal] PEDIDOS");
+        Console.WriteLine("1. Criar pedido (rascunho)");
+        Console.WriteLine("2. Listar pedidos e status");
+        Console.WriteLine("3. Consultar pedido e histórico");
+        Console.WriteLine("4. Editar rascunho");
+        Console.WriteLine("5. Excluir pedido da listagem");
+        Console.WriteLine("6. Enviar rascunho para processamento");
+        Console.WriteLine("7. Listar registros excluídos");
+        Console.WriteLine("0. Sair");
+        Console.Write("Opção: ");
+        try
         {
-            Console.WriteLine("[MS.Principal] Criando novo pedido...");
-            // Cria novo pedido
-            var novoPedido = new PedidoCriado
+            switch (Console.ReadLine()?.Trim())
             {
-                ClienteId = "915d5e76-ab62-43ae-99c4-4d2075125cc9"
-            };
-
-            bool pedidoFinalizado = false;
-            bool pedidoCancelado = false;
-
-            while (!pedidoFinalizado && !pedidoCancelado)
-            {
-                Console.Write("ID do item: ");
-                var itemId = Console.ReadLine()?.Trim();
-                if (itemId is null)
-                {
-                    pedidoCancelado = true;
+                case "1":
+                    var novo = LerPedido();
+                    if (novo is null) break;
+                    var criado = orders.Criar(novo);
+                    Console.WriteLine($"[MS.Principal] Pedido salvo: {criado.Pedido.Id}. Status: rascunho.");
+                    Console.Write("Enviar para processamento agora? (s/N): ");
+                    if (Console.ReadLine()?.Trim().Equals("s", StringComparison.OrdinalIgnoreCase) == true)
+                        Enviar(criado.Pedido.Id);
                     break;
-                }
-
-                if (string.IsNullOrWhiteSpace(itemId))
-                {
-                    Console.WriteLine("[MS.Principal] O ID do item não pode ser vazio.");
-                    continue;
-                }
-
-                if (novoPedido.Itens.Any(item => item.Id == itemId))
-                {
-                    Console.WriteLine("[MS.Principal] Este item já foi adicionado ao pedido.");
-                    continue;
-                }
-
-                int quantidade;
-                while (true)
-                {
-                    Console.Write("Quantidade: ");
-                    var quantidadeInformada = Console.ReadLine();
-                    if (quantidadeInformada is null)
-                    {
-                        pedidoCancelado = true;
-                        break;
-                    }
-
-                    if (int.TryParse(quantidadeInformada, out quantidade) && quantidade > 0)
-                    {
-                        novoPedido.Itens.Add(new ItemPedido { Id = itemId, Quantidade = quantidade });
-                        Console.WriteLine($"[MS.Principal] Item {itemId} adicionado: {quantidade} unidade(s).");
-                        break;
-                    }
-
-                    Console.WriteLine("[MS.Principal] Informe uma quantidade inteira maior que zero.");
-                }
-
-                if (pedidoCancelado)
-                {
+                case "2":
+                    Listar(orders.Listar());
                     break;
-                }
-
-                bool adicionarOutro = false;
-                while (!adicionarOutro && !pedidoFinalizado && !pedidoCancelado)
-                {
-                    Console.WriteLine("1. Adicionar outro item");
-                    Console.WriteLine("2. Finalizar pedido");
-                    Console.WriteLine("3. Cancelar e voltar");
-
-                    switch (Console.ReadLine())
-                    {
-                        case "1":
-                            adicionarOutro = true;
-                            break;
-                        case "2":
-                            pedidoFinalizado = true;
-                            break;
-                        case "3":
-                        case null:
-                            pedidoCancelado = true;
-                            break;
-                        default:
-                            Console.WriteLine("[MS.Principal] Opção inválida. Tente novamente.");
-                            break;
-                    }
-                }
+                case "3":
+                    var consultado = Selecionar();
+                    if (consultado is not null) Exibir(consultado);
+                    break;
+                case "4":
+                    var atual = Selecionar();
+                    if (atual is null) break;
+                    if (atual.Status != "rascunho")
+                        throw new InvalidOperationException("Somente rascunhos podem ser editados.");
+                    Exibir(atual);
+                    var editado = LerPedido(atual.Pedido);
+                    if (editado is null) break;
+                    orders.Editar(atual.Pedido.Id, editado.ClienteId, editado.Itens);
+                    Console.WriteLine("[MS.Principal] Alterações salvas.");
+                    break;
+                case "5":
+                    var excluido = Selecionar();
+                    if (excluido is null) break;
+                    orders.Excluir(excluido.Pedido.Id);
+                    Console.WriteLine("[MS.Principal] Pedido excluído da listagem. Histórico preservado.");
+                    break;
+                case "6":
+                    var envio = Selecionar();
+                    if (envio is not null) Enviar(envio.Pedido.Id);
+                    break;
+                case "7":
+                    Listar(orders.Listar(incluirExcluidos: true).Where(p => p.Excluido).ToList());
+                    break;
+                case "0":
+                case null:
+                    running = false;
+                    break;
+                default:
+                    Console.WriteLine("[MS.Principal] Opção inválida.");
+                    break;
             }
-
-            if (pedidoCancelado)
-            {
-                Console.WriteLine("[MS.Principal] Criação do pedido cancelada.");
-                break;
-            }
-
-            // Assina o pedido
-            string pedidoJson = JsonSerializer.Serialize(novoPedido);
-            var signed = signature.SignText(pedidoJson, privateKeyPath);
-
-            // Cria Mensagem
-            var eventMessage = new Message<PedidoCriado>
-            {
-                Producer = "MS.Principal",
-                Content = novoPedido,
-                Signature = signed,
-            };
-
-            // Serializa mensagem
-            string jsonMensagem = JsonSerializer.Serialize(eventMessage);
-            byte[] body = Encoding.UTF8.GetBytes(jsonMensagem);
-
-            // Envia mensagem ao evento
-            orders.TryAdd(novoPedido.Id, (novoPedido, "pedido.criado"));
-            await channel.BasicPublishAsync(
-                exchange: "eCommerce",
-                routingKey: "pedido.criado",
-                body: body
-            );
-
-            Console.WriteLine($"Mensagem enviada:\n{jsonMensagem}");
-            break;
         }
-        case "2":
-            foreach (var order in orders.Values.OrderBy(order => order.Pedido.Id))
-            {
-                Console.WriteLine($"[MS.Principal] Pedido {order.Pedido.Id}, cliente {order.Pedido.ClienteId}");
-                foreach (var item in order.Pedido.Itens)
-                    Console.WriteLine($"  Item {item.Id}: {item.Quantidade} unidade(s)");
-            }
-            if (orders.IsEmpty) Console.WriteLine("[MS.Principal] Nenhum pedido registrado.");
-            break;
-        case "3":
-            Console.WriteLine("[MS.Principal] Removing orders...");
-            break;
-        case "4":
-            foreach (var order in orders.Values.OrderBy(order => order.Pedido.Id))
-                Console.WriteLine($"[MS.Principal] Pedido {order.Pedido.Id}: {order.Status}");
-            if (orders.IsEmpty) Console.WriteLine("[MS.Principal] Nenhum pedido registrado.");
-            break;
-        case "5":
-        case null:
-            Console.WriteLine("[MS.Principal] Saindo...");
-            return;
-        default:
-            Console.WriteLine("[MS.Principal] Invalid option. Please try again.");
-            break;
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine($"[MS.Principal] Operação não concluída: {ex.Message}");
+        }
+    }
+}
+finally
+{
+    stopping.Cancel();
+    await publisher;
+    await consumerChannel.BasicCancelAsync(consumerTag);
+}
+Console.WriteLine("[MS.Principal] Pedidos salvos. Saindo...");
+
+void Enviar(string id)
+{
+    orders.Enviar(id);
+    Console.WriteLine($"[MS.Principal] Pedido {id} salvo para envio. A publicação será tentada automaticamente até ser confirmada.");
+}
+
+PedidoRegistro? Selecionar()
+{
+    Console.Write("ID completo do pedido (Enter para voltar): ");
+    string? id = Console.ReadLine()?.Trim();
+    if (string.IsNullOrEmpty(id)) return null;
+    return orders.Consultar(id) ?? throw new InvalidOperationException("Pedido não encontrado.");
+}
+
+void Listar(List<PedidoRegistro> registros)
+{
+    if (registros.Count == 0) Console.WriteLine("[MS.Principal] Nenhum pedido encontrado.");
+    var pendentes = orders.PublicacoesPendentes().Select(m => m.Content.Id).ToHashSet();
+    foreach (var registro in registros)
+    {
+        Console.WriteLine($"{registro.Pedido.Id} | Cliente: {registro.Pedido.ClienteId} | Status: {registro.Status}" +
+            (pendentes.Contains(registro.Pedido.Id) ? " | Publicação pendente" : "") +
+            (registro.Excluido ? " | Excluído" : ""));
     }
 }
 
-// Events from different producers may arrive out of order.
-static int StatusStage(string status) => status switch
+void Exibir(PedidoRegistro registro)
 {
-    "pedido.criado" => 0,
-    "pedido.estoque_ok" => 1,
-    "pagamento.aprovado" or "pagamento.recusado" or "estoque.indisponivel" => 2,
-    "pedido.enviado" => 3,
-    _ => -1
-};
+    Listar([registro]);
+    Console.WriteLine($"Criado: {registro.CriadoEm.ToLocalTime():g} | Atualizado: {registro.AtualizadoEm.ToLocalTime():g}");
+    foreach (var item in registro.Pedido.Itens)
+        Console.WriteLine($"  Item {item.Id}: {item.Quantidade} unidade(s)");
+    Console.WriteLine("Histórico:");
+    foreach (var evento in registro.Historico)
+        Console.WriteLine($"  {evento.RecebidoEm.ToLocalTime():G} | {evento.Evento} | {evento.Produtor}" +
+            (evento.Aplicado ? "" : " | Não alterou o status"));
+}
+
+PedidoCriado? LerPedido(PedidoCriado? original = null)
+{
+    Console.WriteLine("Digite /cancelar para voltar sem salvar.");
+    var pedido = new PedidoCriado { Id = original?.Id ?? Guid.NewGuid().ToString() };
+    while (true)
+    {
+        Console.Write(original is null ? "ID do cliente: " : $"ID do cliente (Enter mantém {original.ClienteId}): ");
+        string? cliente = Console.ReadLine()?.Trim();
+        if (cliente is null or "/cancelar") return null;
+        pedido.ClienteId = string.IsNullOrEmpty(cliente) ? original?.ClienteId ?? "" : cliente;
+        if (!string.IsNullOrWhiteSpace(pedido.ClienteId)) break;
+        Console.WriteLine("Informe o ID do cliente.");
+    }
+    if (original is not null)
+    {
+        Console.Write("Substituir a lista de itens? (s/N): ");
+        string? resposta = Console.ReadLine()?.Trim();
+        if (resposta is null or "/cancelar") return null;
+        if (!resposta.Equals("s", StringComparison.OrdinalIgnoreCase))
+        {
+            pedido.Itens = original.Itens;
+            return pedido;
+        }
+    }
+    while (true)
+    {
+        Console.Write("ID do item (Enter finaliza a lista): ");
+        string? id = Console.ReadLine()?.Trim();
+        if (id is null or "/cancelar") return null;
+        if (id.Length == 0)
+        {
+            if (pedido.Itens.Count > 0) return pedido;
+            Console.WriteLine("Adicione pelo menos um item.");
+            continue;
+        }
+        if (pedido.Itens.Any(i => i.Id == id))
+        {
+            Console.WriteLine("Item já adicionado.");
+            continue;
+        }
+        while (true)
+        {
+            Console.Write("Quantidade: ");
+            string? quantidade = Console.ReadLine()?.Trim();
+            if (quantidade is null or "/cancelar") return null;
+            if (int.TryParse(quantidade, out int valor) && valor > 0)
+            {
+                pedido.Itens.Add(new ItemPedido { Id = id, Quantidade = valor });
+                break;
+            }
+            Console.WriteLine("Informe uma quantidade inteira maior que zero.");
+        }
+    }
+}
+
+async Task PublicarPendenciasAsync(CancellationToken token)
+{
+    while (!token.IsCancellationRequested)
+    {
+        try
+        {
+            foreach (var mensagem in orders.PublicacoesPendentes())
+            {
+                token.ThrowIfCancellationRequested();
+                mensagem.Signature = signature.SignText(JsonSerializer.Serialize(mensagem.Content), privateKeyPath);
+                var properties = new BasicProperties
+                {
+                    Persistent = true,
+                    ContentType = "application/json",
+                    MessageId = mensagem.MessageId
+                };
+                await publisherChannel.BasicPublishAsync("eCommerce", "pedido.criado", mandatory: true,
+                    basicProperties: properties, body: Encoding.UTF8.GetBytes(JsonSerializer.Serialize(mensagem)),
+                    cancellationToken: token);
+                orders.ConfirmarPublicacao(mensagem.MessageId);
+                Console.WriteLine($"\n[MS.Principal] Evento pedido.criado confirmado pelo RabbitMQ para {mensagem.Content.Id}.");
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[MS.Principal] Publicação pendente; nova tentativa em 3 segundos: {ex.Message}");
+        }
+        try { await Task.Delay(3000, token); }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
+    }
+}

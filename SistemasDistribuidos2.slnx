@@ -11,4 +11,7 @@
     <Project Path="MS.Promocoes/MS.Promocoes.csproj" />
   </Folder>
   <Project Path="Foundation/Foundation.csproj" />
+  <Folder Name="/Tests/">
+    <Project Path="Tests/MS.Principal.Tests/MS.Principal.Tests.csproj" />
+  </Folder>
 </Solution>
