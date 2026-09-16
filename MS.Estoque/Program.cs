@@ -3,6 +3,7 @@ using Foundation.Keys;
 using Foundation.Models;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 
@@ -16,18 +17,17 @@ var keyManagement = new KeyManagement(solutionRootPath, "MS.Estoque");
 keyManagement.CheckKeys();
 var signatureService = new SignatureService();
 
-// Set products quantity
-var inventory = new Dictionary<string, int>
-{
-    { "A", 10 },
-    { "B", 5 },
-    { "C", 0 },
-    { "D", 1 },
-};
-
-// Keep the original reservation so rejection/deletion restores it only once.
+string inventoryFilePath = Path.Combine(solutionRootPath, "MS.Estoque", "Estoque.ini");
+var inventory = LoadInventory(inventoryFilePath);
+var inventoryLock = new Lock();
 var reservations = new Dictionary<string, List<ItemPedido>>();
 var processedOrders = new HashSet<string>();
+
+Console.WriteLine($"[MS.Estoque] Estoque carregado de {inventoryFilePath}");
+foreach (var product in inventory.OrderBy(product => product.Key))
+{
+    Console.WriteLine($"[MS.Estoque] Produto {product.Key}: {product.Value} unidade(s)");
+}
 
 // RabbitMQ Connection
 var factory = new ConnectionFactory { HostName = "localhost" };
@@ -153,36 +153,41 @@ consumer.ReceivedAsync += async (model, ea) =>
     // Check routing key
     if (routingKey == "pedido.criado")
     {
-        if (!processedOrders.Add(eventMessage.Content.Id))
-        {
-            Console.WriteLine($"[MS.Estoque] Order {eventMessage.Content.Id} already processed; ignoring duplicate.");
-            return;
-        }
+        bool itemsAvailable;
 
-        bool itemsAvailable = true;
-
-        // Check if all items are available
-        foreach (var item in eventMessage.Content.Itens)
+        // The availability check and reservation form one atomic operation.
+        lock (inventoryLock)
         {
-            if (!inventory.ContainsKey(item.Id) || inventory[item.Id] < item.Quantidade)
+            if (!processedOrders.Add(eventMessage.Content.Id))
             {
-                itemsAvailable = false;
-                Console.WriteLine($"[MS.Estoque] Insufficient stock or item not found for ItemId '{item.Id}'");
-                break;
+                Console.WriteLine($"[MS.Estoque] Order {eventMessage.Content.Id} already processed; ignoring duplicate.");
+                return;
+            }
+
+            itemsAvailable = eventMessage.Content.Itens.All(item =>
+                inventory.TryGetValue(item.Id, out int available) && available >= item.Quantidade);
+
+            if (itemsAvailable)
+            {
+                foreach (var item in eventMessage.Content.Itens)
+                {
+                    inventory[item.Id] -= item.Quantidade;
+                    Console.WriteLine($"[MS.Estoque] Removed {item.Quantidade} of Item {item.Id}. Remaining: {inventory[item.Id]}");
+                }
+
+                reservations[eventMessage.Content.Id] = eventMessage.Content.Itens;
+                SaveInventory(inventoryFilePath, inventory);
+            }
+            else
+            {
+                var unavailableItem = eventMessage.Content.Itens.First(item =>
+                    !inventory.TryGetValue(item.Id, out int available) || available < item.Quantidade);
+                Console.WriteLine($"[MS.Estoque] Insufficient stock or item not found for ItemId '{unavailableItem.Id}'");
             }
         }
 
         if (itemsAvailable)
         {
-            // Remove items from stock
-            foreach (var item in eventMessage.Content.Itens)
-            {
-                inventory[item.Id] -= item.Quantidade;
-                Console.WriteLine($"[MS.Estoque] Removed {item.Quantidade} of Item {item.Id}. Remaining: {inventory[item.Id]}");
-            }
-
-            reservations[eventMessage.Content.Id] = eventMessage.Content.Itens;
-
             // Publish success event
             await PublishEventAsync(channel, "pedido.estoque_ok", eventMessage.Content, signatureService, privateKeyPath);
         }
@@ -197,20 +202,25 @@ consumer.ReceivedAsync += async (model, ea) =>
 
     else if (routingKey is "pedido.excluido")
     {
-        if (!reservations.Remove(eventMessage.Content.Id, out var reservedItems))
-        {
-            Console.WriteLine($"[MS.Estoque] No reservation to restore for Order {eventMessage.Content.Id}; event '{routingKey}' ignored.");
-            return;
-        }
-
         // Restore items to inventory
-        foreach (var item in reservedItems)
+        lock (inventoryLock)
         {
-            if (inventory.ContainsKey(item.Id))
+            if (!reservations.Remove(eventMessage.Content.Id, out var reservedItems))
             {
-                inventory[item.Id] += item.Quantidade;
-                Console.WriteLine($"[MS.Estoque] Restored {item.Quantidade} for Item {item.Id}. Available: {inventory[item.Id]}. Order: {eventMessage.Content.Id}, event: {routingKey}");
+                Console.WriteLine($"[MS.Estoque] No reservation to restore for Order {eventMessage.Content.Id}; event '{routingKey}' ignored.");
+                return;
             }
+
+            foreach (var item in reservedItems)
+            {
+                if (inventory.ContainsKey(item.Id))
+                {
+                    inventory[item.Id] += item.Quantidade;
+                    Console.WriteLine($"[MS.Estoque] Restored {item.Quantidade} for Item {item.Id}");
+                }
+            }
+
+            SaveInventory(inventoryFilePath, inventory);
         }
     }
 
@@ -247,4 +257,64 @@ async Task PublishEventAsync<T>(IChannel channel, string routingKey, T pedido, S
     );
 
     Console.WriteLine($"[MS.Estoque] Event '{routingKey}' published");
+}
+
+static Dictionary<string, int> LoadInventory(string filePath)
+{
+    if (!File.Exists(filePath))
+    {
+        throw new FileNotFoundException("Arquivo de estoque não encontrado.", filePath);
+    }
+
+    var inventory = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    bool inInventorySection = false;
+
+    foreach (string rawLine in File.ReadLines(filePath))
+    {
+        string line = rawLine.Trim();
+        if (string.IsNullOrEmpty(line) || line.StartsWith(';') || line.StartsWith('#'))
+        {
+            continue;
+        }
+
+        if (line.StartsWith('[') && line.EndsWith(']'))
+        {
+            inInventorySection = line.Equals("[Estoque]", StringComparison.OrdinalIgnoreCase);
+            continue;
+        }
+
+        if (!inInventorySection)
+        {
+            continue;
+        }
+
+        string[] parts = line.Split('=', 2, StringSplitOptions.TrimEntries);
+        if (parts.Length != 2 || string.IsNullOrWhiteSpace(parts[0]) ||
+            !int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int quantity) || quantity < 0)
+        {
+            throw new InvalidDataException($"Linha inválida no arquivo de estoque: '{rawLine}'.");
+        }
+
+        if (!inventory.TryAdd(parts[0], quantity))
+        {
+            throw new InvalidDataException($"Produto duplicado no arquivo de estoque: '{parts[0]}'.");
+        }
+    }
+
+    if (inventory.Count == 0)
+    {
+        throw new InvalidDataException("A seção [Estoque] está ausente ou vazia.");
+    }
+
+    return inventory;
+}
+
+static void SaveInventory(string filePath, IReadOnlyDictionary<string, int> inventory)
+{
+    var lines = new List<string> { "[Estoque]" };
+    lines.AddRange(inventory.OrderBy(product => product.Key).Select(product =>
+        $"{product.Key}={product.Value.ToString(CultureInfo.InvariantCulture)}"));
+
+    File.WriteAllLines(filePath, lines);
+    Console.WriteLine("[MS.Estoque] Estoque salvo no arquivo INI.");
 }
