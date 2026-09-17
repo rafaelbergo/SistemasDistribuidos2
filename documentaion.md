@@ -22,10 +22,13 @@ A regra arquitetural principal é que os processos não realizam chamadas direta
 ├── Foundation/
 │   ├── Keys/KeyManagement.cs
 │   ├── Models/PedidoCriado.cs
+│   ├── Models/CatalogoProdutos.cs
 │   ├── Models/Promocao.cs
 │   ├── Message.cs
 │   └── SignatureService.cs
 ├── MS.Principal/
+│   ├── ConsultaProdutosClient.cs
+│   ├── PedidoRepository.cs
 │   └── Program.cs
 ├── MS.Estoque/
 │   ├── Estoque.ini
@@ -40,6 +43,44 @@ A regra arquitetural principal é que os processos não realizam chamadas direta
 ├── stop-services.sh
 ├── SistemasDistribuidos2.slnx
 └── README.md
+```
+
+### 6.4. Consulta e catálogo de produtos
+
+Arquivo:
+
+```text
+Foundation/Models/CatalogoProdutos.cs
+```
+
+Solicitação:
+
+```csharp
+public class ConsultaProdutos
+{
+    public string Id { get; set; }
+}
+```
+
+Resposta:
+
+```csharp
+public class CatalogoProdutos
+{
+    public string ConsultaId { get; set; }
+    public List<ProdutoDisponivel> Produtos { get; set; }
+}
+```
+
+Cada produto possui:
+
+```csharp
+public class ProdutoDisponivel
+{
+    public string Id { get; set; }
+    public string Descricao { get; set; }
+    public int QuantidadeDisponivel { get; set; }
+}
 ```
 
 Os diretórios `bin/` e `obj/` contêm artefatos gerados pelo .NET e não fazem parte da implementação da aplicação.
@@ -64,6 +105,7 @@ Os microsserviços referenciam esse projeto por meio de `ProjectReference`.
 Responsabilidades atuais:
 
 - exibir o menu principal;
+- consultar produtos e quantidades disponíveis por evento;
 - coletar os itens e quantidades de um pedido;
 - impedir itens duplicados no mesmo pedido;
 - validar quantidades maiores que zero;
@@ -76,7 +118,20 @@ Exchange: eCommerce
 Routing key: pedido.criado
 ```
 
-O menu também exibe opções para listar, remover e consultar pedidos, mas essas funcionalidades ainda não estão implementadas.
+O menu também permite listar pedidos, consultar o histórico e reenviar rascunhos pendentes.
+
+#### Consulta de produtos
+
+A opção **4. Visualizar produtos** não acessa diretamente o arquivo do Estoque. Ela utiliza uma solicitação assíncrona:
+
+1. O Principal cria um identificador único para a consulta.
+2. Cria uma fila temporária, exclusiva e com remoção automática.
+3. Vincula essa fila à routing key `produtos.listados.<id-da-consulta>`.
+4. Publica uma solicitação assinada com a routing key `produtos.consultar`.
+5. Aguarda uma resposta válida por até cinco segundos.
+6. Exibe o ID, a descrição e a quantidade disponível de cada produto.
+
+Se o Estoque estiver parado ou não responder, o Principal informa a indisponibilidade e retorna ao menu.
 
 ### 3.3. MS.Estoque
 
@@ -97,6 +152,7 @@ Eventos consumidos:
 ```text
 pedido.criado
 pedido.excluido
+produtos.consultar
 ```
 
 Eventos publicados:
@@ -104,7 +160,10 @@ Eventos publicados:
 ```text
 pedido.estoque_ok
 estoque.indisponivel
+produtos.listados.<id-da-consulta>
 ```
+
+Ao receber `produtos.consultar`, o Estoque valida a assinatura do Principal, cria uma fotografia do saldo atual e devolve um `CatalogoProdutos` assinado. A consulta não reserva produtos; a disponibilidade é verificada novamente quando o pedido `pedido.criado` for processado.
 
 ### 3.4. MS.Pagamento
 
@@ -189,6 +248,8 @@ direct
 | `pagamento.recusado` | `MS.Pagamento` | `MS.Principal` |
 | `pedido.enviado` | `MS.Entrega` | `MS.Principal` |
 | `pedido.excluido` | `MS.Principal` | `MS.Estoque` |
+| `produtos.consultar` | `MS.Principal` | `MS.Estoque` |
+| `produtos.listados.<id-da-consulta>` | `MS.Estoque` | fila temporária do `MS.Principal` |
 
 Como a exchange é `direct`, a routing key precisa coincidir com o binding da fila.
 
@@ -230,6 +291,7 @@ Bindings:
 fila_estoque:
   pedido.criado
   pedido.excluido
+  produtos.consultar
 
 fila_pagamento:
   pedido.estoque_ok
@@ -239,6 +301,8 @@ fila_entrega:
 ```
 
 O `MS.Principal` ainda precisa criar uma fila própria para consumir os eventos de atualização do pedido.
+
+Para consultas de produtos, o Principal cria uma fila temporária exclusiva por solicitação. Essa fila recebe somente a resposta cujo identificador corresponde à consulta realizada.
 
 ## 5. Fluxo de processamento de um pedido
 
@@ -260,7 +324,38 @@ Depois de finalizar o pedido:
 3. o conteúdo é colocado no envelope `Message<PedidoCriado>`;
 4. a mensagem é publicada com `pedido.criado`.
 
-### 5.2. Reserva de estoque
+### 5.2. Consulta de produtos
+
+Antes de criar um pedido, o usuário pode escolher **Visualizar produtos**. O Principal publica:
+
+```text
+produtos.consultar
+```
+
+O Estoque responde com:
+
+```text
+produtos.listados.<id-da-consulta>
+```
+
+A resposta contém:
+
+```json
+{
+  "consultaId": "identificador-da-consulta",
+  "produtos": [
+    {
+      "id": "A",
+      "descricao": "Produto A",
+      "quantidadeDisponivel": 4
+    }
+  ]
+}
+```
+
+O resultado é apenas uma fotografia do estoque. Entre a consulta e a criação do pedido, outro pedido pode consumir o mesmo produto. Por isso, o Estoque sempre faz uma nova validação ao receber `pedido.criado`.
+
+### 5.3. Reserva de estoque
 
 O `MS.Estoque` recebe o evento e:
 
@@ -286,7 +381,7 @@ estoque.indisponivel
 
 A validação de todos os itens ocorre antes de qualquer baixa. Assim, um pedido que não possa ser atendido não reduz parcialmente o estoque.
 
-### 5.3. Pagamento
+### 5.4. Pagamento
 
 O `MS.Pagamento` recebe `pedido.estoque_ok`, valida a assinatura e sorteia o resultado:
 
@@ -306,7 +401,7 @@ Em caso de recusa, publica:
 pagamento.recusado
 ```
 
-### 5.4. Entrega
+### 5.5. Entrega
 
 O `MS.Entrega` consome `pagamento.aprovado`, valida a assinatura e simula:
 
@@ -320,7 +415,7 @@ Ao terminar, publica:
 pedido.enviado
 ```
 
-### 5.5. Falhas e cancelamento
+### 5.6. Falhas e cancelamento
 
 O fluxo planejado prevê que o `MS.Principal` consuma:
 
@@ -617,6 +712,8 @@ Implementado:
 - exchanges `eCommerce` e `Promoções`;
 - fluxo Estoque → Pagamento → Entrega;
 - publicação de pedidos;
+- consulta de produtos pelo Principal através de eventos;
+- resposta do Estoque com catálogo e saldo atual;
 - publicação de promoções;
 - assinatura e validação dos eventos;
 - geração e distribuição de chaves públicas;
@@ -694,6 +791,6 @@ O projeto atende ou encaminha os seguintes requisitos:
 | Consumidor C2 | Ausente |
 | Assinatura dos eventos | Implementada |
 | Validação das assinaturas | Implementada |
-| Consulta de pedidos e status | Pendente |
+| Consulta de produtos | Implementada por eventos |
+| Consulta de pedidos e status | Implementada no Principal |
 | Exclusão e devolução completa | Pendente |
-

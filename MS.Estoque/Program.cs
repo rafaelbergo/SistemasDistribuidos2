@@ -63,12 +63,7 @@ await channel.QueueBindAsync(
     routingKey: "pedido.excluido"
 );
 
-// Configure async consumer
-await channel.QueueBindAsync(
-    queue: queueName,
-    exchange: "eCommerce",
-    routingKey: "pagamento.recusado"
-);
+
 
 var consumer = new AsyncEventingBasicConsumer(channel);
 

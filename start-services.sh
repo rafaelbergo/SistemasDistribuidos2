@@ -10,6 +10,8 @@ SERVICES=(
     "MS.Estoque"
     "MS.Pagamento"
     "MS.Promocoes"
+    "Consumidor.C1"
+    "Consumidor.C2"
     "MS.Entrega"
     "MS.Principal"
 )
